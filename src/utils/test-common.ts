@@ -346,9 +346,7 @@ export function createTestExecutor(
             started,
             succeeded: !testWithoutBuildingResult.isError,
             target,
-            artifacts: createXcodebuildTestArtifacts(params, started, resultBundlePath, {
-              testProductsPath,
-            }),
+            artifacts: createXcodebuildTestArtifacts(params, started, resultBundlePath),
             fallbackErrorMessages: getFallbackErrorMessages(
               started.stderrLines,
               testWithoutBuildingResult.content,
@@ -357,7 +355,7 @@ export function createTestExecutor(
             request: options.request,
           });
         },
-        { isSuccessful: () => managedOutputWasProduced },
+        { isSuccessful: () => managedOutputWasProduced, retainOnSuccess: false },
       );
     }
 

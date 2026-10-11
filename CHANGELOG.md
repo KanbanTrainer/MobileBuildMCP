@@ -10,6 +10,8 @@
 ### Fixed
 
 - Managed `.xctestproducts` now prune promptly around builds and tests, defaulting to three bundles retained for one day. Set `MOBILEBUILDMCP_TEST_PRODUCTS_MAX_COUNT` or `MOBILEBUILDMCP_TEST_PRODUCTS_MAX_AGE_DAYS` to override those limits ([#524](https://github.com/getsentry/MobileBuildMCP/issues/524)).
+- Source-based test calls now retire their internal `.xctestproducts` after the test process settles. Use an explicit build-for-testing call when a prepared bundle must outlive one test call.
+- MCP startup now prunes expired or excess managed test products across abandoned workspace keys while preserving active producers and readers.
 
 ## [2.7.0]
 

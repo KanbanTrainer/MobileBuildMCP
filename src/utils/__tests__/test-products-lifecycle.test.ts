@@ -14,6 +14,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createMockFileSystemExecutor } from '../../test-utils/mock-executors.ts';
 import {
   TEST_PRODUCTS_MAX_AGE_MS,
+  getManagedTestProductsRetentionStateDir,
+  pruneManagedTestProductsAcrossWorkspaces,
   pruneManagedTestProductsDirectory,
   type ManagedTestProductsFileSystem,
   type ManagedTestProductsLifecycleDependencies,
@@ -317,6 +319,99 @@ describe('test products lifecycle', () => {
     expect(existsSync(getTestProductsCompletionMarkerPath(outputPath))).toBe(false);
   });
 
+  it('retires a successful transient output after its consumer settles', async () => {
+    let outputPath = '';
+    const result = await withManagedTestProductsOutput(
+      'test_sim',
+      async (testProductsPath) => {
+        outputPath = testProductsPath;
+        mkdirSync(testProductsPath);
+        writeFileSync(path.join(testProductsPath, 'Tests.xctestrun'), 'stub');
+        return 'passed';
+      },
+      { retainOnSuccess: false, dependencies },
+    );
+
+    expect(result).toBe('passed');
+    expect(existsSync(outputPath)).toBe(false);
+    expect(existsSync(getTestProductsCompletionMarkerPath(outputPath))).toBe(false);
+  });
+
+  it('preserves a successful transient result when cleanup fails', async () => {
+    let outputPath = '';
+    const cleanupFailureFileSystem: ManagedTestProductsFileSystem = {
+      ...dependencies.fileSystem!,
+      rm: async () => {
+        throw new Error('cleanup failed');
+      },
+    };
+
+    const result = await withManagedTestProductsOutput(
+      'test_sim',
+      async (testProductsPath) => {
+        outputPath = testProductsPath;
+        mkdirSync(testProductsPath);
+        writeFileSync(path.join(testProductsPath, 'Tests.xctestrun'), 'stub');
+        return 'passed';
+      },
+      {
+        retainOnSuccess: false,
+        dependencies: { ...dependencies, fileSystem: cleanupFailureFileSystem },
+      },
+    );
+
+    expect(result).toBe('passed');
+    expect(existsSync(outputPath)).toBe(true);
+  });
+
+  it('protects a prepared output from count pruning until its retention expires', async () => {
+    let now = Date.UTC(2026, 4, 6, 12);
+    let outputPath = '';
+    await withManagedTestProductsOutput(
+      'build_sim',
+      async (testProductsPath) => {
+        outputPath = testProductsPath;
+        mkdirSync(testProductsPath);
+        writeFileSync(path.join(testProductsPath, 'Tests.xctestrun'), 'stub');
+      },
+      {
+        workspaceKey: 'workspace-a',
+        maxAgeMs: DAY_MS,
+        dependencies: { ...dependencies, now: () => now },
+      },
+    );
+    utimesSync(outputPath, new Date(now), new Date(now));
+
+    const retentionStateDir = getManagedTestProductsRetentionStateDir('workspace-a');
+    expect(
+      await pruneManagedTestProductsDirectory({
+        testProductsDir: getWorkspaceFilesystemLayout('workspace-a').testProducts,
+        retentionStateDir,
+        now,
+        minVisibleMs: 0,
+        maxAgeMs: 10 * DAY_MS,
+        maxCount: 0,
+        dependencies,
+      }),
+    ).toEqual({ scanned: 1, deleted: 0 });
+    expect(existsSync(outputPath)).toBe(true);
+
+    now += DAY_MS + 1;
+    expect(
+      await pruneManagedTestProductsDirectory({
+        testProductsDir: getWorkspaceFilesystemLayout('workspace-a').testProducts,
+        retentionStateDir,
+        now,
+        minVisibleMs: 0,
+        maxAgeMs: 10 * DAY_MS,
+        maxCount: 0,
+        dependencies,
+      }),
+    ).toEqual({ scanned: 1, deleted: 1 });
+    expect(existsSync(outputPath)).toBe(false);
+    expect(existsSync(path.join(retentionStateDir, path.basename(outputPath)))).toBe(false);
+  });
+
   it('fails loudly when a successful operation does not create its managed output', async () => {
     await expect(
       withManagedTestProductsOutput('build_sim', async () => 'success', { dependencies }),
@@ -432,6 +527,31 @@ describe('test products lifecycle', () => {
     expect(existsSync(readerDirectory)).toBe(false);
   });
 
+  it('preserves a successful reader result when release-time pruning fails', async () => {
+    const now = Date.now();
+    const layout = getWorkspaceFilesystemLayout('workspace-a');
+    const testProductsPath = path.join(layout.testProducts, managedName('prepared'));
+    writeTestProducts(testProductsPath, now, true);
+    let lockAttempts = 0;
+
+    const result = await withManagedTestProductsReader(testProductsPath, async () => 'passed', {
+      workspaceKey: 'workspace-a',
+      lockTimeoutMs: 0,
+      dependencies: {
+        ...dependencies,
+        now: () => now,
+        tryAcquireLock: async () => {
+          lockAttempts += 1;
+          return lockAttempts === 1 ? acquiredLock() : null;
+        },
+      },
+    });
+
+    expect(result).toBe('passed');
+    expect(lockAttempts).toBe(2);
+    expect(existsSync(testProductsPath)).toBe(true);
+  });
+
   it('cleans dead reader markers before pruning', async () => {
     const now = Date.now();
     const layout = getWorkspaceFilesystemLayout('workspace-a');
@@ -471,5 +591,60 @@ describe('test products lifecycle', () => {
     );
 
     expect(operationRan).toBe(true);
+  });
+
+  it('prunes abandoned workspace products while preserving fresh and active products', async () => {
+    const now = Date.UTC(2026, 4, 6, 12);
+    const orphanLayout = getWorkspaceFilesystemLayout('orphan-aaaaaaaaaaaa');
+    const activeLayout = getWorkspaceFilesystemLayout('active-bbbbbbbbbbbb');
+    const expired = path.join(orphanLayout.testProducts, managedName('expired'));
+    const fresh = path.join(orphanLayout.testProducts, managedName('fresh'));
+    const active = path.join(activeLayout.testProducts, managedName('active', process.pid));
+    writeTestProducts(expired, now - 2 * DAY_MS, true);
+    writeTestProducts(fresh, now - DAY_MS + 1, true);
+    writeTestProducts(active, now - 2 * DAY_MS);
+
+    const result = await pruneManagedTestProductsAcrossWorkspaces({
+      maxAgeMs: DAY_MS,
+      maxCount: 3,
+      dependencies: {
+        ...dependencies,
+        now: () => now,
+        tryAcquireLock: async () => acquiredLock(),
+      },
+    });
+
+    expect(result).toEqual({
+      workspaceCount: 2,
+      scanned: 3,
+      deleted: 1,
+      skippedLocked: 0,
+      skippedByGlobalLock: false,
+      errors: [],
+    });
+    expect(existsSync(expired)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(active)).toBe(true);
+  });
+
+  it('skips a workspace with an active lifecycle lock', async () => {
+    const now = Date.UTC(2026, 4, 6, 12);
+    const layout = getWorkspaceFilesystemLayout('locked-cccccccccccc');
+    const expired = path.join(layout.testProducts, managedName('expired'));
+    writeTestProducts(expired, now - 2 * DAY_MS, true);
+
+    const result = await pruneManagedTestProductsAcrossWorkspaces({
+      maxAgeMs: DAY_MS,
+      dependencies: {
+        ...dependencies,
+        now: () => now,
+        tryAcquireLock: async (options) =>
+          options.purpose === 'test-products-global-sweep' ? acquiredLock() : null,
+      },
+    });
+
+    expect(result.skippedLocked).toBe(1);
+    expect(result.deleted).toBe(0);
+    expect(existsSync(expired)).toBe(true);
   });
 });

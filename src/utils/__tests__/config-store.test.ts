@@ -153,6 +153,8 @@ describe('config-store', () => {
       'schemaVersion: 1',
       'filePathRenderStyle: tree',
       'axeSourcePath: /file/AXe',
+      'testProductsMaxCount: 5',
+      'testProductsMaxAgeDays: 2',
       '',
     ].join('\n');
     const env = {
@@ -164,6 +166,8 @@ describe('config-store', () => {
 
     expect(getConfig().filePathRenderStyle).toBe('tree');
     expect(getConfig().axeSourcePath).toBe('/file/AXe');
+    expect(getConfig().testProductsMaxCount).toBe(5);
+    expect(getConfig().testProductsMaxAgeDays).toBe(2);
   });
 
   it('reads sentryDisabled from config file', async () => {
@@ -171,8 +175,7 @@ describe('config-store', () => {
 
     await initConfigStore({ cwd, fs: createFs(yaml) });
 
-    const config = getConfig();
-    expect(config.sentryDisabled).toBe(true);
+    expect(getConfig().sentryDisabled).toBe(true);
   });
 
   it('resolves enabledWorkflows from overrides, config, then defaults', async () => {

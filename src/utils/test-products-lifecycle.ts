@@ -8,7 +8,11 @@ import {
   getConfig,
 } from './config-store.ts';
 import { tryAcquireFsLock, type AcquiredFsLock, type TryAcquireFsLockOptions } from './fs-lock.ts';
-import { getWorkspaceFilesystemLayout } from './log-paths.ts';
+import {
+  getMobileBuildMCPAppDir,
+  getWorkspaceFilesystemLayout,
+  getWorkspacesDir,
+} from './log-paths.ts';
 import { log } from './logger.ts';
 import { isPidAlive } from './process-liveness.ts';
 import { getRuntimeInstanceIfConfigured } from './runtime-instance.ts';
@@ -25,11 +29,16 @@ export const TEST_PRODUCTS_MAX_AGE_MS = DEFAULT_TEST_PRODUCTS_MAX_AGE_DAYS * TES
 export const TEST_PRODUCTS_MAX_COUNT = DEFAULT_TEST_PRODUCTS_MAX_COUNT;
 
 const TEST_PRODUCTS_READER_STATE_DIR = 'test-products-readers';
+const TEST_PRODUCTS_RETENTION_STATE_DIR = 'test-products-retentions';
 const TEST_PRODUCTS_LOCK_PURPOSE = 'filesystem-lifecycle';
 const TEST_PRODUCTS_LOCK_LEASE_MS = 10 * 60 * 1000;
 const TEST_PRODUCTS_LOCK_TIMEOUT_MS = TEST_PRODUCTS_LOCK_LEASE_MS;
 const TEST_PRODUCTS_LOCK_RETRY_MS = 50;
+const TEST_PRODUCTS_GLOBAL_SWEEP_LOCK_PURPOSE = 'test-products-global-sweep';
+const TEST_PRODUCTS_GLOBAL_SWEEP_LOCK_LEASE_MS = 10 * 60 * 1000;
 const READER_MARKER_PATTERN = /^pid(\d+)_[a-f0-9-]+\.reader$/u;
+const RETENTION_MARKER_PATTERN = /^until(\d+)\.lease$/u;
+const WORKSPACE_KEY_PATTERN = /^.+-[a-f0-9]{12}$/u;
 
 interface RetainedTestProducts {
   path: string;
@@ -42,6 +51,7 @@ export interface TestProductsProtectionOptions {
   minVisibleMs: number;
   protectedPaths?: ReadonlySet<string>;
   readerStateDir?: string;
+  retentionStateDir?: string;
   dependencies?: Partial<ManagedTestProductsLifecycleDependencies>;
 }
 
@@ -49,6 +59,16 @@ export interface PruneManagedTestProductsOptions extends TestProductsProtectionO
   testProductsDir: string;
   maxAgeMs?: number;
   maxCount?: number;
+  createDirectory?: boolean;
+}
+
+export interface ManagedTestProductsGlobalSweepResult {
+  workspaceCount: number;
+  scanned: number;
+  deleted: number;
+  skippedLocked: number;
+  skippedByGlobalLock: boolean;
+  errors: string[];
 }
 
 export interface ManagedTestProductsLifecycleOptions {
@@ -62,6 +82,7 @@ export interface ManagedTestProductsLifecycleOptions {
 
 export type ManagedTestProductsOutputOptions<T> = ManagedTestProductsLifecycleOptions & {
   isSuccessful?: (result: T) => boolean;
+  retainOnSuccess?: boolean;
 };
 
 export interface ManagedTestProductsFileSystem {
@@ -93,6 +114,7 @@ export interface ManagedTestProductsLifecycleDependencies {
 interface ResolvedManagedTestProductsLifecycle {
   testProductsDir: string;
   readerStateDir: string;
+  retentionStateDir: string;
   lockDir: string;
   maxAgeMs: number;
   maxCount: number;
@@ -127,6 +149,13 @@ export function getManagedTestProductsReaderStateDir(workspaceKey: string): stri
   return path.join(
     getWorkspaceFilesystemLayout(workspaceKey).state,
     TEST_PRODUCTS_READER_STATE_DIR,
+  );
+}
+
+export function getManagedTestProductsRetentionStateDir(workspaceKey: string): string {
+  return path.join(
+    getWorkspaceFilesystemLayout(workspaceKey).state,
+    TEST_PRODUCTS_RETENTION_STATE_DIR,
   );
 }
 
@@ -166,6 +195,9 @@ function resolveManagedTestProductsLifecycle(
   return {
     testProductsDir: layout.testProducts,
     readerStateDir: getManagedTestProductsReaderStateDir(
+      resolveWorkspaceKey(options.workspaceKey, dependencies),
+    ),
+    retentionStateDir: getManagedTestProductsRetentionStateDir(
       resolveWorkspaceKey(options.workspaceKey, dependencies),
     ),
     lockDir: layout.filesystemLifecycle.lockDir,
@@ -246,6 +278,39 @@ async function hasLiveReader(
   return liveReader;
 }
 
+async function hasActiveRetention(
+  artifact: RetainedTestProducts,
+  retentionStateDir: string,
+  now: number,
+  dependencies: ManagedTestProductsLifecycleDependencies,
+): Promise<boolean> {
+  const directory = readerDirectory(retentionStateDir, artifact.name);
+  let entries: Dirent[];
+  try {
+    entries = await dependencies.fileSystem.readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return false;
+    }
+    throw error;
+  }
+  let active = false;
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const match = entry.name.match(RETENTION_MARKER_PATTERN);
+    const expiresAt = Number(match?.[1]);
+    if (Number.isFinite(expiresAt) && expiresAt > now) {
+      active = true;
+    } else {
+      await dependencies.fileSystem.rm(path.join(directory, entry.name), { force: true });
+    }
+  }
+  if (!active) {
+    await removeReaderDirectoryIfEmpty(directory, dependencies);
+  }
+  return active;
+}
+
 export async function isProtectedManagedTestProducts(
   artifact: RetainedTestProducts,
   options: TestProductsProtectionOptions,
@@ -257,6 +322,12 @@ export async function isProtectedManagedTestProducts(
   if (
     options.readerStateDir &&
     (await hasLiveReader(artifact, options.readerStateDir, dependencies))
+  ) {
+    return true;
+  }
+  if (
+    options.retentionStateDir &&
+    (await hasActiveRetention(artifact, options.retentionStateDir, options.now, dependencies))
   ) {
     return true;
   }
@@ -283,12 +354,25 @@ export async function pruneManagedTestProductsDirectory(
   const readerStateDir =
     options.readerStateDir ??
     path.join(path.dirname(options.testProductsDir), 'state', TEST_PRODUCTS_READER_STATE_DIR);
+  const retentionStateDir =
+    options.retentionStateDir ??
+    path.join(path.dirname(options.testProductsDir), 'state', TEST_PRODUCTS_RETENTION_STATE_DIR);
   const protectedPaths = new Set(
     [...(options.protectedPaths ?? [])].map((protectedPath) => path.resolve(protectedPath)),
   );
 
-  await fileSystem.mkdir(options.testProductsDir, { recursive: true, mode: 0o700 });
-  const entries = await fileSystem.readdir(options.testProductsDir, { withFileTypes: true });
+  if (options.createDirectory !== false) {
+    await fileSystem.mkdir(options.testProductsDir, { recursive: true, mode: 0o700 });
+  }
+  let entries: Dirent[];
+  try {
+    entries = await fileSystem.readdir(options.testProductsDir, { withFileTypes: true });
+  } catch (error) {
+    if (options.createDirectory === false && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { scanned: 0, deleted: 0 };
+    }
+    throw error;
+  }
   const candidates = entries
     .filter((entry) => entry.isDirectory() && isMobileBuildMCPManagedTestProductsName(entry.name))
     .map((entry) => ({
@@ -321,6 +405,7 @@ export async function pruneManagedTestProductsDirectory(
         minVisibleMs: options.minVisibleMs,
         protectedPaths,
         readerStateDir,
+        retentionStateDir,
         dependencies,
       })
     ) {
@@ -350,6 +435,10 @@ export async function pruneManagedTestProductsDirectory(
           recursive: true,
           force: true,
         });
+        await fileSystem.rm(readerDirectory(retentionStateDir, artifact.name), {
+          recursive: true,
+          force: true,
+        });
         return true;
       } catch {
         return false;
@@ -361,6 +450,91 @@ export async function pruneManagedTestProductsDirectory(
     scanned: stats.filter((artifact) => artifact !== null).length,
     deleted: deletions.filter(Boolean).length,
   };
+}
+
+export async function pruneManagedTestProductsAcrossWorkspaces(
+  options: ManagedTestProductsLifecycleOptions = {},
+): Promise<ManagedTestProductsGlobalSweepResult> {
+  const dependencies = resolveDependencies(options.dependencies);
+  const emptyResult: ManagedTestProductsGlobalSweepResult = {
+    workspaceCount: 0,
+    scanned: 0,
+    deleted: 0,
+    skippedLocked: 0,
+    skippedByGlobalLock: false,
+    errors: [],
+  };
+  const globalLock = await dependencies.tryAcquireLock({
+    lockDir: path.join(getMobileBuildMCPAppDir(), 'locks', 'test-products-global-sweep.lock'),
+    purpose: TEST_PRODUCTS_GLOBAL_SWEEP_LOCK_PURPOSE,
+    leaseMs: TEST_PRODUCTS_GLOBAL_SWEEP_LOCK_LEASE_MS,
+    now: dependencies.now(),
+    pid: dependencies.pid(),
+  });
+  if (!globalLock) {
+    return { ...emptyResult, skippedByGlobalLock: true };
+  }
+
+  try {
+    let entries: Dirent[];
+    try {
+      entries = await dependencies.fileSystem.readdir(getWorkspacesDir(), { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return emptyResult;
+      }
+      throw error;
+    }
+
+    const workspaceKeys = entries
+      .filter((entry) => entry.isDirectory() && WORKSPACE_KEY_PATTERN.test(entry.name))
+      .map((entry) => entry.name)
+      .sort();
+    const result = { ...emptyResult, workspaceCount: workspaceKeys.length, errors: [] as string[] };
+    for (const workspaceKey of workspaceKeys) {
+      const lifecycle = resolveManagedTestProductsLifecycle({
+        ...options,
+        workspaceKey,
+        dependencies,
+      });
+      let workspaceLock: AcquiredFsLock | null = null;
+      try {
+        workspaceLock = await dependencies.tryAcquireLock({
+          lockDir: lifecycle.lockDir,
+          purpose: TEST_PRODUCTS_LOCK_PURPOSE,
+          leaseMs: TEST_PRODUCTS_LOCK_LEASE_MS,
+          now: dependencies.now(),
+          pid: dependencies.pid(),
+        });
+        if (!workspaceLock) {
+          result.skippedLocked += 1;
+          continue;
+        }
+        const pruned = await pruneManagedTestProductsDirectory({
+          testProductsDir: lifecycle.testProductsDir,
+          readerStateDir: lifecycle.readerStateDir,
+          retentionStateDir: lifecycle.retentionStateDir,
+          now: dependencies.now(),
+          minVisibleMs: 0,
+          maxAgeMs: lifecycle.maxAgeMs,
+          maxCount: lifecycle.maxCount,
+          createDirectory: false,
+          dependencies,
+        });
+        result.scanned += pruned.scanned;
+        result.deleted += pruned.deleted;
+      } catch (error) {
+        result.errors.push(
+          `${workspaceKey}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      } finally {
+        await workspaceLock?.release();
+      }
+    }
+    return result;
+  } finally {
+    await globalLock.release();
+  }
 }
 
 async function acquireLifecycleLock(
@@ -409,6 +583,7 @@ async function pruneForLifecycle(
   await pruneManagedTestProductsDirectory({
     testProductsDir: lifecycle.testProductsDir,
     readerStateDir: lifecycle.readerStateDir,
+    retentionStateDir: lifecycle.retentionStateDir,
     now: lifecycle.dependencies.now(),
     minVisibleMs: 0,
     maxAgeMs: lifecycle.maxAgeMs,
@@ -430,6 +605,15 @@ async function finalizeAfterOperation(
     }
     const message = finalizeError instanceof Error ? finalizeError.message : String(finalizeError);
     log('warn', `Managed test products finalization failed after operation error: ${message}`);
+  }
+}
+
+async function finalizeBestEffort(label: string, finalize: () => Promise<void>): Promise<void> {
+  try {
+    await finalize();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log('warn', `Managed test products ${label} failed: ${message}`);
   }
 }
 
@@ -476,6 +660,24 @@ async function removeManagedTestProductsOutput(
     getTestProductsCompletionMarkerPath(testProductsPath),
     { recursive: true, force: true },
   );
+  await lifecycle.dependencies.fileSystem.rm(
+    readerDirectory(lifecycle.retentionStateDir, path.basename(testProductsPath)),
+    { recursive: true, force: true },
+  );
+}
+
+async function retainManagedTestProductsOutput(
+  testProductsPath: string,
+  lifecycle: ResolvedManagedTestProductsLifecycle,
+): Promise<void> {
+  const directory = readerDirectory(lifecycle.retentionStateDir, path.basename(testProductsPath));
+  await lifecycle.dependencies.fileSystem.mkdir(directory, { recursive: true, mode: 0o700 });
+  const expiresAt = lifecycle.dependencies.now() + lifecycle.maxAgeMs;
+  await lifecycle.dependencies.fileSystem.writeFile(
+    path.join(directory, `until${expiresAt}.lease`),
+    `${path.resolve(testProductsPath)}\n`,
+    { encoding: 'utf8', flag: 'wx', mode: 0o600 },
+  );
 }
 
 export async function withManagedTestProductsOutput<T>(
@@ -515,10 +717,21 @@ export async function withManagedTestProductsOutput<T>(
     return result as T;
   }
 
+  if (options.retainOnSuccess === false) {
+    await finalizeBestEffort('transient cleanup', async () => {
+      await withLifecycleLock(lifecycle, async () => {
+        await removeManagedTestProductsOutput(testProductsPath, lifecycle);
+        await pruneForLifecycle(lifecycle, lifecycle.maxCount);
+      });
+    });
+    return result as T;
+  }
+
   await finalizeAfterOperation(false, async () => {
     await withLifecycleLock(lifecycle, async () => {
       try {
         await markManagedTestProductsCompleted(testProductsPath, lifecycle.dependencies);
+        await retainManagedTestProductsOutput(testProductsPath, lifecycle);
       } catch (error) {
         await removeManagedTestProductsOutput(testProductsPath, lifecycle);
         throw error;
@@ -600,7 +813,7 @@ export async function withManagedTestProductsReader<T>(
     operationError = error;
   }
 
-  await finalizeAfterOperation(operationFailed, async () => {
+  await finalizeBestEffort('reader cleanup', async () => {
     await lifecycle.dependencies.fileSystem.rm(markerPath, { force: true });
     await removeReaderDirectoryIfEmpty(directory, lifecycle.dependencies);
     await withLifecycleLock(lifecycle, async () => {
